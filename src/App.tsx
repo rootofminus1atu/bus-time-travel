@@ -4,6 +4,9 @@ import axios from 'axios'
 import { useQuery } from '@tanstack/react-query'
 import L from 'leaflet'
 
+const API_URL = import.meta.env.VITE_API_URL;
+
+
 // TODO: 
 // - consider what happens when a vehicle stops operating
 // - handle cases when theres less than 10 or 20 records (should be doable after flattening the output)
@@ -68,7 +71,7 @@ function getSegmentOpacity(idx: number, total: number) {
 }
 
 async function fetchHistory(): Promise<Record[]> {
-  const res = await axios.get<Record[]>('http://localhost:3000/history')
+  const res = await axios.get<Record[]>(`${API_URL}/history`)
   const data = res.data.reverse()
   return data
 }
