@@ -1,9 +1,10 @@
 import type { LatLngExpression } from "leaflet"
-import { CircleMarker, MapContainer, Marker, Polyline, Popup, TileLayer } from "react-leaflet"
+import { CircleMarker, MapContainer, Marker, Polyline, Popup, TileLayer, useMap } from "react-leaflet"
 import axios from 'axios'
 import { useQuery } from '@tanstack/react-query'
 import L from 'leaflet'
-
+import { useEffect, useState } from "react"
+import ReactDOM from "react-dom"
 const API_URL = import.meta.env.VITE_API_URL;
 
 
@@ -80,10 +81,37 @@ async function fetchHistory(): Promise<Record[]> {
 const center: LatLngExpression = [51.897797, -8.441600]
 
 function App() {
-  const { data, isError, error } = useQuery({
+  const { data, isError, error, refetch } = useQuery({
     queryKey: ['history'],
-    queryFn: fetchHistory
+    queryFn: fetchHistory,
+    // refetchInterval: 30000
   })
+
+  // all below is for a CUSTOM 30s refetcher
+  useEffect(() => {
+    let timeout: number
+
+    const schedule = () => {
+      timeout = setTimeout(() => {
+        refetch().then(schedule)
+      }, 30000)
+    }
+
+    schedule()
+    return () => { 
+      clearTimeout(timeout)      
+    }
+  }, [refetch])
+
+  const [refreshKey, setRefreshKey] = useState(0)
+  const handleManualRefresh = () => {
+    setRefreshKey(k => k + 1)
+  }
+
+  useEffect(() => {
+    refetch()
+  }, [refreshKey, refetch])
+  // up to this point
 
   console.log(data)
 
@@ -132,6 +160,8 @@ function App() {
   return (
     <div>
       <MapContainer center={center} zoom={14} style={{ height: "100%", width: "100%" }}>
+        <RefreshControl onRefresh={handleManualRefresh} />
+        <ClockControl />
         <TileLayer
           url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
         />
@@ -214,3 +244,83 @@ function App() {
 }
 
 export default App
+
+
+
+
+
+
+function RefreshControl({ onRefresh }: { onRefresh: () => void }) {
+  const map = useMap()
+
+  useEffect(() => {
+    const control = (L.control as any)({ position: "topright" })
+    control.onAdd = function () {
+      const div = L.DomUtil.create("div", "leaflet-bar leaflet-control leaflet-control-custom")
+      div.style.backgroundColor = "white"
+      div.style.width = "34px"
+      div.style.height = "34px"
+      div.style.display = "flex"
+      div.style.alignItems = "center"
+      div.style.justifyContent = "center"
+      div.style.cursor = "pointer"
+      div.title = "Refresh"
+      div.innerHTML = "&#x21bb;"
+      div.onclick = (e) => {
+        e.preventDefault()
+        onRefresh()
+      }
+      return div
+    }
+    control.addTo(map)
+    return () => {
+      control.remove()
+    }
+  }, [map, onRefresh])
+
+  return null
+}
+
+function ClockControl() {
+  const [now, setNow] = useState(() => new Date())
+  useEffect(() => {
+    // will prob desync with time
+    const interval = setInterval(() => setNow(new Date()), 1000)
+    return () => clearInterval(interval)
+  }, [])
+
+  const mapContainer = document.querySelector('.leaflet-container')
+  if (!mapContainer) return null
+
+  return ReactDOM.createPortal(
+    <div
+      className="leaflet-top leaflet-center"
+      style={{
+        position: "absolute",
+        top: 10,
+        left: "50%",
+        transform: "translateX(-50%)",
+        zIndex: 1000,
+        pointerEvents: "none"
+      }}
+    >
+      <div
+        className="leaflet-control leaflet-bar"
+        style={{
+          display: "inline-block",
+          padding: "4px 16px",
+          fontWeight: "bold",
+          fontSize: "16px",
+          background: "white",
+          borderRadius: "4px",
+          boxShadow: "0 2px 8px #0002",
+          pointerEvents: "auto",
+          margin: "0"
+        }}
+      >
+        {now.toLocaleTimeString()}
+      </div>
+    </div>,
+    mapContainer
+  )
+}
