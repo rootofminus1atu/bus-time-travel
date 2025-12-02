@@ -78,7 +78,7 @@ async function fetchHistory(): Promise<Record[]> {
 }
 
 // TODO: center at city c
-const center: LatLngExpression = [51.897797, -8.441600]
+const center: LatLngExpression = [54.2712971, -8.4725301]
 
 function App() {
   const { data, isError, error, refetch } = useQuery({
