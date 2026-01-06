@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, hash::Hash, io::Cursor, sync::Arc};
 use tokio::sync::Mutex;
 use axum::{response::IntoResponse, routing::get, Extension, Json, Router};
 use dotenvy::dotenv;
@@ -6,51 +6,83 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use chrono::Utc;
 use tower_http::cors::{CorsLayer, Any};
-use std::sync::LazyLock;
+use zip::ZipArchive;
+use tokio::sync::Notify;
 
 
 type GenericError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 type LocationHistory = Arc<Mutex<Vec<Record>>>;
+type RouteInfoMap = Arc<Mutex<HashMap<String, RouteInfo>>>;
 
 
-pub static ROUTES: LazyLock<HashMap<String, RouteInfo>> = LazyLock::new(|| {
-    let contents = std::fs::read_to_string("assets/routes.txt").expect("Failed to read routes file");
-    let mut rdr = csv::ReaderBuilder::new()
-        .has_headers(true)
-        .from_reader(contents.as_bytes());
+// pub static ROUTES: LazyLock<HashMap<String, RouteInfo>> = LazyLock::new(|| {
+//     let contents = std::fs::read_to_string("assets/routes.txt").expect("Failed to read routes file");
+//     let mut rdr = csv::ReaderBuilder::new()
+//         .has_headers(true)
+//         .from_reader(contents.as_bytes());
 
-    rdr.records()
-        .filter_map(|result| {
-            result.ok().and_then(|rec| {
-                let route_id = rec.get(0)?.to_string();
-                let short_name = rec.get(2)?.to_string();
-                let long_name = rec.get(3)?.to_string();
-                Some(RouteInfo { route_id, short_name, long_name })
-            })
-        })
-        .map(|r| (r.route_id.clone(), r))
-        .collect()
-});
+//     rdr.records()
+//         .filter_map(|result| {
+//             result.ok().and_then(|rec| {
+//                 let route_id = rec.get(0)?.to_string();
+//                 let route_short_name = rec.get(2)?.to_string();
+//                 let route_long_name = rec.get(3)?.to_string();
+//                 Some(RouteInfo { route_id, route_short_name, route_long_name })
+//             })
+//         })
+//         .map(|r| (r.route_id.clone(), r))
+//         .collect()
+// });
 
 #[tokio::main]
 async fn main() -> Result<(), GenericError> {
     println!("Hello, world!");
     dotenv().ok();
 
-    LazyLock::force(&ROUTES);
+    let routes_ready = Arc::new(Notify::new());
 
-
+    // LazyLock::force(&ROUTES);
     let api_key = std::env::var("API_KEY").expect("no api key found");
     let client = ClientWithKeys::new(api_key.clone(), api_key);
     let history: LocationHistory = Arc::new(Mutex::new(Vec::new()));
 
+    let route_info_list: Arc<Mutex<HashMap<String, RouteInfo>>> = Arc::new(Mutex::new(HashMap::new()));
     let client_clone = client.clone();
-    let history_clone = history.clone();
+    let route_info_list_clone = route_info_list.clone();
+
+    let routes_ready_clone = routes_ready.clone();
 
     tokio::spawn(async move {
+        let mut first = true;
         loop {
-            match get_location(&client_clone).await {
+            match refresh_routes(&client_clone).await {
+                Ok(routes) => {
+                    let mut list = route_info_list_clone.lock().await;
+                    *list = routes;
+                    println!("Route info refreshed!");
+                    if first {
+                        routes_ready_clone.notify_waiters();
+                        first = false;
+                    }
+                }
+                Err(e) => {
+                    println!("Failed to refresh routes: {e}");
+                }
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await; // 1 hour
+        }
+    });
+
+    let client_clone = client.clone();
+    let history_clone = history.clone();
+    let routes_ready_clone = routes_ready.clone();
+    let route_info_list_clone = route_info_list.clone();
+
+    tokio::spawn(async move {
+        routes_ready_clone.notified().await;
+        loop {
+            match get_location(&client_clone, route_info_list_clone).await {
                 Ok(record) => {
                     let mut list = history_clone.lock().await;
                     list.push(record);
@@ -81,7 +113,8 @@ async fn main() -> Result<(), GenericError> {
         .route("/history", get(get_history))
         .layer(cors)
         .layer(Extension(history))
-        .layer(Extension(client));
+        .layer(Extension(client))
+        .layer(Extension(route_info_list));
 
     let listener = tokio::net::TcpListener::bind("localhost:3000").await.unwrap();
     println!("listening on 3000");
@@ -90,8 +123,43 @@ async fn main() -> Result<(), GenericError> {
     Ok(())
 }
 
+use std::io::Read;
+
+async fn refresh_routes(client: &ClientWithKeys) -> Result<HashMap<String, RouteInfo>, GenericError> {
+    let url = "https://www.transportforireland.ie/transitData/Data/GTFS_All.zip";
+
+    let bytes = client.client
+        .get(url)
+        .send()
+        .await?
+        .bytes()
+        .await?;
+
+    let reader = Cursor::new(bytes);
+    let mut archive = ZipArchive::new(reader).unwrap();
+
+    let mut file = archive.by_name("routes.txt")?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)?;
+
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .from_reader(contents.as_bytes());
+    
+    let mut routes = HashMap::new();
+    for result in rdr.deserialize() {
+        let route: RouteInfo = result?;
+        routes.insert(route.route_short_name.clone(), route);
+    }
+
+    Ok(routes)
+}
+
 async fn get_current(Extension(client): Extension<ClientWithKeys>) -> Result<impl IntoResponse, Error> {
-    get_location(&client).await.map(Json)
+    // get_location(&client).await.map(Json)
+    // todo!()
+
+    Ok(Json(vec!["h"]))
 }
 
 async fn get_history(Extension(history): Extension<LocationHistory>) -> Result<impl IntoResponse, Error> {
@@ -99,7 +167,7 @@ async fn get_history(Extension(history): Extension<LocationHistory>) -> Result<i
     Ok(Json(list))
 }
 
-async fn get_location(client: &ClientWithKeys) -> Result<Record, Error> {
+async fn get_location(client: &ClientWithKeys, route_info_map: RouteInfoMap) -> Result<Record, Error> {
     let res = client.client.get("https://api.nationaltransport.ie/gtfsr/v2/Vehicles?format=json")
         .header("x-api-key", client.bus_api_key.as_str())
         .send()
@@ -121,18 +189,23 @@ async fn get_location(client: &ClientWithKeys) -> Result<Record, Error> {
     let res: Res = serde_json::from_value(res)?;
 
 
-    let route_ids = ["4658_98094", "4658_98097", "4658_98087", "4658_98244", "4685_99482"];
-    
-    // let entity = res.entity.iter().find(|e| e.vehicle.trip.route_id == route_id).expect("damn it doesnt exist wtf");
-    // dbg!(&entity);
+    let busses_to_watch = ["212", "215"];
+
+    let routes = {
+        let route_info = route_info_map.lock().await;
+
+        route_info.into_iter()
+            .filter(|entry| busses_to_watch.contains(&entry.1.route_short_name.as_str()))
+            .collect::<HashMap<_, _>>()
+    };
     
     let locations = res.entity.iter()
-        .filter(|e| route_ids.contains(&e.vehicle.trip.route_id.as_str()))
+        .filter(|e| routes.values().map(|r| r.route_id).collect::<Vec<_>>().contains(&e.vehicle.trip.route_id.as_str()))
         .map(|e| Location {
             lat: e.vehicle.position.latitude, 
             lon: e.vehicle.position.longitude,
             ts: e.vehicle.timestamp.clone(),
-            route: ROUTES.get(&e.vehicle.trip.route_id).unwrap().clone(),
+            route: routes.get(&e.vehicle.trip.route_id).unwrap(),
             vehicle_id: e.vehicle.vehicle.id.clone()
         })
         .collect::<Vec<_>>();
@@ -259,9 +332,11 @@ struct Position {
     longitude: f64
 }
 
-#[derive(Serialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct RouteInfo {
     route_id: String,
-    short_name: String,
-    long_name: String
+    route_short_name: String,
+    route_long_name: String
 }
+
+
