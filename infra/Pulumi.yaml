@@ -1,0 +1,11 @@
+name: bus-time-travel
+description: bus time travel while its on aws
+runtime:
+  name: python
+  options:
+    toolchain: pip
+    virtualenv: venv
+config:
+  pulumi:tags:
+    value:
+      pulumi:template: aws-python
